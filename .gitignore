@@ -1,0 +1,17 @@
+node_modules/
+.wrangler/
+.officeflare-deploy-*.jsonc
+dist/
+coverage/
+worker-configuration.d.ts
+
+# Local environment variables and secrets
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+.env
+.env.*
+!.env.example
+
+*.log
+.DS_Store

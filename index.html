@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="{{i18n:locale}}">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="icon" href="/favicon.png" type="image/png" sizes="32x32" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (() => {
+        let preference = "system";
+        try { preference = localStorage.getItem("officeflare.color-theme") || "system"; } catch {}
+        const scheme = preference === "dark" || preference !== "light" && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.colorScheme = scheme;
+        document.documentElement.style.colorScheme = `only ${scheme}`;
+        document.querySelector('meta[name="color-scheme"]').setAttribute("content", scheme);
+      })();
+    </script>
+    <meta name="description" content="{{i18n:shell.description}}" />
+    <title>{{i18n:shell.title}}</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <noscript>{{i18n:shell.enableJavaScript}}</noscript>
+    <script type="module" src="/web/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,307 @@
+import { t } from "../../shared/i18n/index.ts";
+import ipaddr from "ipaddr.js";
+import { imageSize } from "image-size";
+import sanitizeHtml from "sanitize-html";
+
+export type RemoteKind = "image" | "stylesheet";
+export interface RemoteAsset {
+  body: Uint8Array;
+  contentType: string;
+  url: string;
+}
+export type RemoteFetcher = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+// Worker runtime methods require their global receiver, unlike Node's fetch.
+export const runtimeRemoteFetcher: RemoteFetcher = (input, init) => globalThis.fetch(input, init);
+const maximumBytes = { image: 5 * 1024 ** 2, stylesheet: 256 * 1024 };
+const privacyHeaders = {
+  "User-Agent": "Officeflare-Mail-Proxy/1.0",
+  "CF-Connecting-IP": "0.0.0.0",
+  "CF-Connecting-IPv6": "::",
+  "X-Real-IP": "0.0.0.0",
+  "X-Forwarded-For": "0.0.0.0",
+  "True-Client-IP": "0.0.0.0",
+};
+
+export function remoteUrl(value: string, base?: string): URL {
+  if (value.length > 4096 || /[\u0000-\u0020\u007f]/.test(value))
+    throw new Error(t("mailRemote.invalidRemoteUrl"));
+  const url = new URL(value, base);
+  if (url.protocol === "http:" && (!url.port || url.port === "80")) {
+    url.protocol = "https:";
+    url.port = "";
+  }
+  const host = url.hostname.toLowerCase().replace(/\.$/, "");
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    (url.port && url.port !== "443") ||
+    !host.includes(".") ||
+    ipaddr.isValid(host.replace(/^\[|\]$/g, "")) ||
+    !/^[a-z0-9.-]+$/.test(host) ||
+    /(?:^|\.)(?:localhost|local|internal|lan|home|onion|arpa|invalid)$/.test(host)
+  )
+    throw new Error(t("mailRemote.remoteResourcesRequireAPublicHttpsHostname"));
+  url.hostname = host;
+  url.hash = "";
+  return url;
+}
+export function publicAddress(value: string): boolean {
+  try {
+    return ipaddr.parse(value).range() === "unicast";
+  } catch {
+    return false;
+  }
+}
+export async function boundedBody(response: Response, maximum: number): Promise<Uint8Array> {
+  if (Number(response.headers.get("Content-Length")) > maximum) {
+    await response.body?.cancel();
+    throw new Error(t("mailRemote.remoteResourceIsTooLarge"));
+  }
+  if (!response.body) throw new Error(t("mailRemote.emptyRemoteResource"));
+  const reader = response.body.getReader(),
+    chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    for (;;) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      size += chunk.value.byteLength;
+      if (size > maximum) throw new Error(t("mailRemote.remoteResourceIsTooLarge"));
+      chunks.push(chunk.value);
+    }
+  } catch (error) {
+    await reader.cancel().catch(() => {});
+    throw error;
+  }
+  if (!size) throw new Error(t("mailRemote.emptyRemoteResource"));
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
+}
+export async function publicDns(hostname: string, fetcher: RemoteFetcher, signal: AbortSignal) {
+  const records = await Promise.all(
+    ["A", "AAAA"].map(async (type) => {
+      const url = `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(hostname)}&type=${type}`;
+      // Workers only implement manual/follow. Reject non-2xx below without following DNS redirects.
+      const response = await fetcher(url, {
+        redirect: "manual",
+        signal,
+        headers: { ...privacyHeaders, Accept: "application/dns-json" },
+      });
+      if (!response.ok) throw new Error(t("mailRemote.dnsLookupFailed"));
+      const result = JSON.parse(
+        new TextDecoder().decode(await boundedBody(response, 16 * 1024)),
+      ) as { Status?: number; Answer?: { type: number; data: string }[] };
+      if (result.Status !== 0) throw new Error(t("mailRemote.dnsLookupFailed"));
+      return (result.Answer ?? [])
+        .filter((record) => record.type === 1 || record.type === 28)
+        .map((record) => record.data);
+    }),
+  );
+  const addresses = records.flat();
+  if (!addresses.length || addresses.some((address) => !publicAddress(address)))
+    throw new Error(t("mailRemote.privateNetworkResourcesAreBlocked"));
+}
+function safeSvg(body: Uint8Array): Uint8Array {
+  const source = new TextDecoder().decode(body);
+  const clean = sanitizeHtml(source, {
+    allowedTags: [
+      "svg",
+      "g",
+      "path",
+      "rect",
+      "circle",
+      "ellipse",
+      "line",
+      "polyline",
+      "polygon",
+      "text",
+      "tspan",
+      "defs",
+      "linearGradient",
+      "radialGradient",
+      "stop",
+      "clipPath",
+      "mask",
+      "title",
+      "desc",
+      "use",
+      "symbol",
+    ],
+    allowedAttributes: {
+      "*": [
+        "xmlns",
+        "id",
+        "x",
+        "y",
+        "x1",
+        "x2",
+        "y1",
+        "y2",
+        "width",
+        "height",
+        "viewBox",
+        "preserveAspectRatio",
+        "d",
+        "points",
+        "r",
+        "rx",
+        "ry",
+        "cx",
+        "cy",
+        "fill",
+        "fill-opacity",
+        "fill-rule",
+        "stroke",
+        "stroke-width",
+        "stroke-opacity",
+        "stroke-linecap",
+        "stroke-linejoin",
+        "opacity",
+        "transform",
+        "offset",
+        "stop-color",
+        "stop-opacity",
+        "gradientUnits",
+        "gradientTransform",
+        "clip-path",
+        "mask",
+        "font-size",
+        "font-family",
+        "text-anchor",
+        "href",
+      ],
+    },
+    parser: { lowerCaseTags: false, lowerCaseAttributeNames: false },
+    allowedSchemes: [],
+    allowProtocolRelative: false,
+    transformTags: {
+      "*": (tagName, attributes) => ({
+        tagName,
+        attribs: {
+          ...Object.fromEntries(
+            Object.entries(attributes).filter(([key, value]) => {
+              if (key === "href") return /^#[a-zA-Z_][\w.-]{0,127}$/.test(value);
+              return !/[<>\\]|(?:url\s*\((?!\s*#[\w.-]+\s*\)))|expression|javascript:|(?:https?|data):/i.test(
+                value,
+              );
+            }),
+          ),
+          ...(tagName === "svg" ? { xmlns: "http://www.w3.org/2000/svg" } : {}),
+        },
+      }),
+    },
+  });
+  if (!/^\s*<svg\b/.test(clean) || clean.length > 256 * 1024)
+    throw new Error(t("mailRemote.invalidSvgImage"));
+  return new TextEncoder().encode(clean);
+}
+export function validatedImage(
+  body: Uint8Array,
+  contentType: string,
+): { body: Uint8Array; contentType: string } {
+  if (contentType === "image/svg+xml") body = safeSvg(body);
+  const dimensions = imageSize(body);
+  const types: Record<string, string> = {
+    png: "image/png",
+    jpg: "image/jpeg",
+    jpeg: "image/jpeg",
+    gif: "image/gif",
+    webp: "image/webp",
+    avif: "image/avif",
+    svg: "image/svg+xml",
+  };
+  const expected = dimensions.type ? types[dimensions.type] : undefined;
+  if (
+    !expected ||
+    expected !== contentType ||
+    !dimensions.width ||
+    !dimensions.height ||
+    dimensions.width * dimensions.height > 40_000_000
+  )
+    throw new Error(t("mailRemote.unsupportedRemoteImage"));
+  return { body, contentType: expected };
+}
+export const isHeifType = (contentType: string) => /^image\/(?:heic|heif)$/.test(contentType);
+export async function renderableImage(
+  body: Uint8Array,
+  contentType: string,
+  images?: ImagesBinding,
+): Promise<{ body: Uint8Array; contentType: string }> {
+  if (body.length > maximumBytes.image) throw new Error(t("mailRemote.remoteResourceIsTooLarge"));
+  if (!isHeifType(contentType)) return validatedImage(body, contentType);
+  if (!images) throw new Error(t("mailRemote.heicConversionRequiresTheMailImagesBinding"));
+  const stream = () => new Response(body as Uint8Array<ArrayBuffer>).body!;
+  const info = await images.info(stream());
+  if (
+    !("width" in info) ||
+    !Number.isSafeInteger(info.width) ||
+    !Number.isSafeInteger(info.height) ||
+    info.width <= 0 ||
+    info.height <= 0 ||
+    info.width * info.height > 40_000_000
+  )
+    throw new Error(t("mailRemote.unsupportedRemoteImage"));
+  const result = await images.input(stream()).output({ format: "image/webp", quality: 85 });
+  return validatedImage(await boundedBody(result.response(), maximumBytes.image), "image/webp");
+}
+export async function fetchRemoteAsset(
+  value: string,
+  kind: RemoteKind,
+  ownHost: string,
+  fetcher: RemoteFetcher = runtimeRemoteFetcher,
+  images?: ImagesBinding,
+): Promise<RemoteAsset> {
+  let url = remoteUrl(value);
+  const signal = AbortSignal.timeout(8000);
+  for (let hop = 0; hop <= 3; hop++) {
+    if (url.hostname === ownHost.toLowerCase().replace(/\.$/, ""))
+      throw new Error(t("mailRemote.applicationResourcesCannotBeProxied"));
+    await publicDns(url.hostname, fetcher, signal);
+    const response = await fetcher(url.href, {
+      signal,
+      redirect: "manual",
+      headers: {
+        ...privacyHeaders,
+        Accept:
+          kind === "image"
+            ? "image/avif,image/webp,image/png,image/jpeg,image/gif,image/svg+xml"
+            : "text/css",
+      },
+    });
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("Location");
+      await response.body?.cancel();
+      if (!location || hop === 3) throw new Error(t("mailRemote.invalidRemoteRedirect"));
+      url = remoteUrl(location, url.href);
+      continue;
+    }
+    if (!response.ok) {
+      await response.body?.cancel();
+      throw new Error(t("mailRemote.remoteResourceUnavailable"));
+    }
+    const contentType =
+      response.headers.get("Content-Type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+    if (
+      (kind === "stylesheet" && contentType !== "text/css") ||
+      (kind === "image" &&
+        !/^image\/(png|jpeg|gif|webp|avif|svg\+xml|heic|heif)$/.test(contentType))
+    ) {
+      await response.body?.cancel();
+      throw new Error(t("mailRemote.unsupportedRemoteResourceType"));
+    }
+    const body = await boundedBody(response, maximumBytes[kind]);
+    return {
+      ...(kind === "image"
+        ? await renderableImage(body, contentType, images)
+        : { body, contentType }),
+      url: url.href,
+    };
+  }
+  throw new Error(t("mailRemote.invalidRemoteRedirect"));
+}
